@@ -6,9 +6,10 @@ use hyper::{
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rand::prelude::*;
 use std::{
+    net::SocketAddr,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicUsize, Ordering::*},
         Arc,
     },
     time::Instant,
@@ -162,6 +163,8 @@ pub enum ClientError {
 }
 
 pub struct Client {
+    pub proxy: Option<ProxyList>,
+
     pub http_version: http::Version,
     pub url_generator: UrlGenerator,
     pub method: http::Method,
@@ -176,6 +179,45 @@ pub struct Client {
     pub unix_socket: Option<std::path::PathBuf>,
     #[cfg(feature = "vsock")]
     pub vsock_addr: Option<tokio_vsock::VsockAddr>,
+}
+
+pub struct ProxyList {
+    pub index: AtomicUsize,
+    pub proxies: &'static mut [Proxy],
+}
+
+#[derive(Clone)]
+pub struct Proxy {
+    pub protocol: ProxyProtocol,
+    pub addr: SocketAddr,
+    pub user: String,
+    pub pass: String,
+}
+
+#[derive(Clone)]
+pub enum ProxyProtocol {
+    Socks,
+    Http1(Http1Method),
+}
+
+#[derive(Clone)]
+pub enum Http1Method {
+    Connect,
+    Other,
+}
+
+impl ProxyList {
+    pub fn get(&self) -> &Proxy {
+        let idx = self.index.fetch_add(1, AcqRel) % self.proxies.len();
+        &self.proxies[idx]
+    }
+
+    pub fn new(ps: Vec<Proxy>) -> Self {
+        Self {
+            index: AtomicUsize::new(0),
+            proxies: ps.leak(),
+        }
+    }
 }
 
 struct ClientStateHttp1 {
@@ -256,6 +298,7 @@ impl Stream {
             }
         }
     }
+
     async fn handshake_http2(self) -> Result<SendRequestHttp2, ClientError> {
         let builder = hyper::client::conn::http2::Builder::new(TokioExecutor::new());
 
@@ -359,8 +402,18 @@ impl Client {
                 Err(_) => Err(ClientError::Timeout),
             };
         }
+
         let addr = self.dns.lookup(url, rng).await?;
         let dns_lookup = Instant::now();
+
+        // Is proxy being used?
+        if let Some(proxy_list) = self.proxy.as_ref() {
+            let proxy = proxy_list.get();
+
+            // Connect to proxy
+            println!("{}", proxy.addr);
+        }
+
         let stream =
             tokio::time::timeout(timeout_duration, tokio::net::TcpStream::connect(addr)).await;
         match stream {

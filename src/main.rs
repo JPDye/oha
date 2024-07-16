@@ -1,5 +1,6 @@
 use anyhow::Context;
 use clap::Parser;
+use client::{Http1Method, Proxy, ProxyList, ProxyProtocol};
 use crossterm::tty::IsTty;
 use futures::prelude::*;
 use hickory_resolver::config::{ResolverConfig, ResolverOpts};
@@ -12,7 +13,14 @@ use printer::PrintMode;
 use rand::prelude::*;
 use rand_regex::Regex;
 use result_data::ResultData;
-use std::{env, io::Read, str::FromStr};
+use rustls_pki_types::Ipv4Addr;
+use std::{
+    env,
+    io::Read,
+    net::{IpAddr, SocketAddr},
+    str::FromStr,
+    sync::atomic::AtomicUsize,
+};
 use url::Url;
 use url_generator::UrlGenerator;
 
@@ -420,8 +428,26 @@ async fn main() -> anyhow::Result<()> {
     resolver_opts.ip_strategy = ip_strategy;
     let resolver = hickory_resolver::AsyncResolver::tokio(config, resolver_opts);
 
+    let proxy_1 = Proxy {
+        protocol: ProxyProtocol::Http1(Http1Method::Connect),
+        addr: SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 8080),
+        user: "user".to_string(),
+        pass: "pass".to_string(),
+    };
+
+    let proxy_2 = Proxy {
+        protocol: ProxyProtocol::Http1(Http1Method::Connect),
+        addr: SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 8081),
+        user: "user".to_string(),
+        pass: "pass".to_string(),
+    };
+
+    let proxies = ProxyList::new(vec![proxy_1, proxy_2]);
+
     // client_builder builds client for each workers
     let client = client::Client {
+        proxy: Some(proxies),
+
         http_version,
         url_generator,
         method: opts.method,
