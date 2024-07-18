@@ -428,21 +428,43 @@ async fn main() -> anyhow::Result<()> {
     resolver_opts.ip_strategy = ip_strategy;
     let resolver = hickory_resolver::AsyncResolver::tokio(config, resolver_opts);
 
-    let proxy_1 = Proxy {
-        protocol: ProxyProtocol::Http1(Http1Method::Connect),
-        addr: SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 8080),
-        user: "user".to_string(),
-        pass: "pass".to_string(),
-    };
+    use std::io::BufRead;
+    let file = std::fs::File::open("proxies.txt").unwrap();
+    let file = std::io::BufReader::new(file);
 
-    let proxy_2 = Proxy {
-        protocol: ProxyProtocol::Http1(Http1Method::Connect),
-        addr: SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 8081),
-        user: "user".to_string(),
-        pass: "pass".to_string(),
-    };
+    let mut proxies = Vec::new();
+    for line in file.lines() {
+        let Ok(line) = line else { break };
 
-    let proxies = ProxyList::new(vec![proxy_1, proxy_2]);
+        if line.is_empty() {
+            break;
+        }
+
+        let (rest, pass) = line.rsplit_once(":").unwrap();
+        println!("{rest} - {pass}");
+        let (rest, user) = rest.rsplit_once(":").unwrap();
+        println!("{rest} - {user}");
+
+        let url = Url::parse(rest).unwrap();
+
+        let protocol = match url.scheme() {
+            "socks" => ProxyProtocol::Socks,
+            "http" => ProxyProtocol::Http1(Http1Method::Connect),
+            _ => panic!("Invalid proxy scheme"),
+        };
+
+        let proxy = Proxy {
+            protocol,
+            url,
+            user: user.to_string(),
+            pass: pass.to_string(),
+        };
+
+        proxies.push(proxy);
+    }
+
+    let proxies = ProxyList::new(proxies);
+    println!("{:?}", proxies.proxies);
 
     // client_builder builds client for each workers
     let client = client::Client {

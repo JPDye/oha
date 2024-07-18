@@ -1,4 +1,4 @@
-use http_body_util::Full;
+use http_body_util::{Empty, Full};
 use hyper::{
     body::{Body, Incoming},
     http,
@@ -16,6 +16,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::net::TcpStream;
+use tokio_socks::tcp::Socks5Stream;
 use url::{ParseError, Url};
 
 use crate::{
@@ -142,6 +143,10 @@ pub enum ClientError {
     HttpError(#[from] http::Error),
     #[error(transparent)]
     HyperError(#[from] hyper::Error),
+
+    #[error(transparent)]
+    SocksError(#[from] tokio_socks::Error),
+
     #[error(transparent)]
     InvalidUriParts(#[from] http::uri::InvalidUriParts),
     #[error(transparent)]
@@ -186,21 +191,21 @@ pub struct ProxyList {
     pub proxies: &'static mut [Proxy],
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Proxy {
     pub protocol: ProxyProtocol,
-    pub addr: SocketAddr,
+    pub url: Url,
     pub user: String,
     pub pass: String,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub enum ProxyProtocol {
     Socks,
     Http1(Http1Method),
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub enum Http1Method {
     Connect,
     Other,
@@ -406,23 +411,112 @@ impl Client {
         let addr = self.dns.lookup(url, rng).await?;
         let dns_lookup = Instant::now();
 
-        // Is proxy being used?
-        if let Some(proxy_list) = self.proxy.as_ref() {
-            let proxy = proxy_list.get();
+        match self.proxy.as_ref() {
+            None => {
+                let stream =
+                    tokio::time::timeout(timeout_duration, tokio::net::TcpStream::connect(addr))
+                        .await;
 
-            // Connect to proxy
-            println!("{}", proxy.addr);
-        }
-
-        let stream =
-            tokio::time::timeout(timeout_duration, tokio::net::TcpStream::connect(addr)).await;
-        match stream {
-            Ok(Ok(stream)) => {
-                stream.set_nodelay(true)?;
-                Ok((dns_lookup, Stream::Tcp(stream)))
+                match stream {
+                    Ok(Ok(stream)) => {
+                        stream.set_nodelay(true)?;
+                        Ok((dns_lookup, Stream::Tcp(stream)))
+                    }
+                    Ok(Err(err)) => Err(ClientError::IoError(err)),
+                    Err(_) => Err(ClientError::Timeout),
+                }
             }
-            Ok(Err(err)) => Err(ClientError::IoError(err)),
-            Err(_) => Err(ClientError::Timeout),
+
+            Some(proxy_list) => {
+                let proxy = proxy_list.get();
+
+                println!("{:?}", proxy.url);
+
+                let proxy_addr = self.dns.lookup(&proxy.url, rng).await?;
+
+                let proxy_stream = tokio::time::timeout(
+                    timeout_duration,
+                    tokio::net::TcpStream::connect(proxy_addr),
+                )
+                .await;
+
+                match proxy_stream {
+                    Ok(Ok(proxy_stream)) => match proxy.protocol {
+                        ProxyProtocol::Socks => {
+                            let stream = tokio::time::timeout(
+                                timeout_duration,
+                                Socks5Stream::connect_with_password_and_socket(
+                                    proxy_stream,
+                                    addr,
+                                    &proxy.user,
+                                    &proxy.pass,
+                                ),
+                            )
+                            .await;
+
+                            match stream {
+                                Ok(Ok(stream)) => {
+                                    let stream = stream.into_inner();
+                                    stream.set_nodelay(true)?;
+                                    Ok((dns_lookup, Stream::Tcp(stream)))
+                                }
+
+                                Ok(Err(err)) => Err(ClientError::SocksError(err)),
+                                Err(_) => Err(ClientError::Timeout),
+                            }
+                        }
+
+                        ProxyProtocol::Http1(Http1Method::Connect) => {
+                            let proxy_stream = TokioIo::new(proxy_stream);
+                            let (mut to_server, conn) =
+                                hyper::client::conn::http1::handshake(proxy_stream).await?;
+
+                            tokio::task::spawn(conn.with_upgrades());
+
+                            let auth = format!("{}:{}", proxy.user, proxy.pass);
+                            use base64::prelude::*;
+                            let auth = BASE64_STANDARD.encode(auth);
+                            let auth = format!("Basic {auth}");
+                            let req = hyper::Request::builder()
+                                .method("CONNECT")
+                                .uri(format!("{}:{}", addr.0, addr.1))
+                                .header(
+                                    hyper::header::PROXY_AUTHORIZATION,
+                                    hyper::header::HeaderValue::from_str(&auth).unwrap(),
+                                )
+                                .body("".to_string())?;
+
+                            let res = to_server.send_request(req).await?;
+
+                            match hyper::upgrade::on(res).await {
+                                Ok(upgraded) => {
+                                    let stream = upgraded
+                                        .downcast::<TokioIo<TcpStream>>()
+                                        .unwrap()
+                                        .io
+                                        .into_inner();
+
+                                    stream.set_nodelay(true)?;
+                                    Ok((dns_lookup, Stream::Tcp(stream)))
+                                }
+
+                                Err(e) => Err(ClientError::HyperError(e)),
+                            }
+                        }
+
+                        ProxyProtocol::Http1(Http1Method::Other) => {
+                            // TODO: Also need to pass proxy auth to the http request somehow.
+                            // TODO: Maybe (dns, stream, Option<Proxy>)
+                            // TODO: And attach proxy user/pass further down the chain?
+                            proxy_stream.set_nodelay(true)?;
+                            Ok((dns_lookup, Stream::Tcp(proxy_stream)))
+                        }
+                    },
+
+                    Ok(Err(err)) => Err(ClientError::IoError(err)),
+                    Err(_) => Err(ClientError::Timeout),
+                }
+            }
         }
     }
 
@@ -536,6 +630,7 @@ impl Client {
                 connection_time = Some(ConnectionTime { dns_lookup, dialup });
                 send_request
             };
+
             while futures::future::poll_fn(|ctx| send_request.poll_ready(ctx))
                 .await
                 .is_err()
