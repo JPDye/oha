@@ -11,9 +11,7 @@ RUN apt-get update && apt-get install -y \
 RUN cargo install --path .
 
 # Target image
-FROM registry.fedoraproject.org/fedora-minimal
+FROM ubuntu:latest
 USER 65535
 
 COPY --chown=65535:65535 --from=build /usr/local/cargo/bin/oha /bin/oha
-
-ENTRYPOINT ["/bin/oha"]

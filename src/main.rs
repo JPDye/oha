@@ -441,9 +441,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         let (rest, pass) = line.rsplit_once(":").unwrap();
-        println!("{rest} - {pass}");
         let (rest, user) = rest.rsplit_once(":").unwrap();
-        println!("{rest} - {user}");
 
         let url = Url::parse(rest).unwrap();
 
@@ -464,7 +462,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let proxies = ProxyList::new(proxies);
-    println!("{:?}", proxies.proxies);
 
     // client_builder builds client for each workers
     let client = client::Client {

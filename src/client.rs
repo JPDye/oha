@@ -157,8 +157,8 @@ pub enum ClientError {
     HeaderToStrError(#[from] http::header::ToStrError),
     #[error(transparent)]
     InvalidUri(#[from] http::uri::InvalidUri),
-    #[error("timeout")]
-    Timeout,
+    #[error("timeout: {0}")]
+    Timeout(String),
     #[error("aborted due to deadline")]
     Deadline,
     #[error(transparent)]
@@ -378,7 +378,9 @@ impl Client {
             return match stream {
                 Ok(Ok(stream)) => Ok((dns_lookup, stream)),
                 Ok(Err(err)) => Err(err),
-                Err(_) => Err(ClientError::Timeout),
+                Err(_) => Err(ClientError::Timeout(
+                    "Timed out attempting TLS connection".into(),
+                )),
             };
         }
         #[cfg(unix)]
@@ -392,7 +394,9 @@ impl Client {
             return match stream {
                 Ok(Ok(stream)) => Ok((dns_lookup, Stream::Unix(stream))),
                 Ok(Err(err)) => Err(ClientError::IoError(err)),
-                Err(_) => Err(ClientError::Timeout),
+                Err(_) => Err(ClientError::Timeout(
+                    "Timed out attempting Unix connection".into(),
+                )),
             };
         }
         #[cfg(feature = "vsock")]
@@ -404,7 +408,9 @@ impl Client {
             return match stream {
                 Ok(Ok(stream)) => Ok((dns_lookup, Stream::Vsock(stream))),
                 Ok(Err(err)) => Err(ClientError::IoError(err)),
-                Err(_) => Err(ClientError::Timeout),
+                Err(_) => Err(ClientError::Timeout(
+                    "Timed out attempting Vsock connection".into(),
+                )),
             };
         }
 
@@ -423,15 +429,14 @@ impl Client {
                         Ok((dns_lookup, Stream::Tcp(stream)))
                     }
                     Ok(Err(err)) => Err(ClientError::IoError(err)),
-                    Err(_) => Err(ClientError::Timeout),
+                    Err(_) => Err(ClientError::Timeout(
+                        "Timed out attempting proxy_http connection".into(),
+                    )),
                 }
             }
 
             Some(proxy_list) => {
                 let proxy = proxy_list.get();
-
-                println!("{:?}", proxy.url);
-
                 let proxy_addr = self.dns.lookup(&proxy.url, rng).await?;
 
                 let proxy_stream = tokio::time::timeout(
@@ -462,45 +467,60 @@ impl Client {
                                 }
 
                                 Ok(Err(err)) => Err(ClientError::SocksError(err)),
-                                Err(_) => Err(ClientError::Timeout),
+                                Err(_) => Err(ClientError::Timeout(
+                                    "Timed out attempting SOCKS proxy handshake".into(),
+                                )),
                             }
                         }
 
                         ProxyProtocol::Http1(Http1Method::Connect) => {
                             let proxy_stream = TokioIo::new(proxy_stream);
-                            let (mut to_server, conn) =
-                                hyper::client::conn::http1::handshake(proxy_stream).await?;
+                            let res = tokio::time::timeout(
+                                timeout_duration,
+                                hyper::client::conn::http1::handshake(proxy_stream),
+                            )
+                            .await;
 
-                            tokio::task::spawn(conn.with_upgrades());
+                            match res {
+                                Ok(Ok((mut to_server, conn))) => {
+                                    tokio::task::spawn(conn.with_upgrades());
 
-                            let auth = format!("{}:{}", proxy.user, proxy.pass);
-                            use base64::prelude::*;
-                            let auth = BASE64_STANDARD.encode(auth);
-                            let auth = format!("Basic {auth}");
-                            let req = hyper::Request::builder()
-                                .method("CONNECT")
-                                .uri(format!("{}:{}", addr.0, addr.1))
-                                .header(
-                                    hyper::header::PROXY_AUTHORIZATION,
-                                    hyper::header::HeaderValue::from_str(&auth).unwrap(),
-                                )
-                                .body("".to_string())?;
+                                    let auth = format!("{}:{}", proxy.user, proxy.pass);
+                                    use base64::prelude::*;
+                                    let auth = BASE64_STANDARD.encode(auth);
+                                    let auth = format!("Basic {auth}");
+                                    let req = hyper::Request::builder()
+                                        .method("CONNECT")
+                                        .uri(format!("{}:{}", addr.0, addr.1))
+                                        .header(
+                                            hyper::header::PROXY_AUTHORIZATION,
+                                            hyper::header::HeaderValue::from_str(&auth).unwrap(),
+                                        )
+                                        .body("".to_string())?;
 
-                            let res = to_server.send_request(req).await?;
+                                    let res = to_server.send_request(req).await?;
 
-                            match hyper::upgrade::on(res).await {
-                                Ok(upgraded) => {
-                                    let stream = upgraded
-                                        .downcast::<TokioIo<TcpStream>>()
-                                        .unwrap()
-                                        .io
-                                        .into_inner();
+                                    match hyper::upgrade::on(res).await {
+                                        Ok(upgraded) => {
+                                            let stream = upgraded
+                                                .downcast::<TokioIo<TcpStream>>()
+                                                .unwrap()
+                                                .io
+                                                .into_inner();
 
-                                    stream.set_nodelay(true)?;
-                                    Ok((dns_lookup, Stream::Tcp(stream)))
+                                            stream.set_nodelay(true)?;
+                                            Ok((dns_lookup, Stream::Tcp(stream)))
+                                        }
+
+                                        Err(e) => Err(ClientError::HyperError(e)),
+                                    }
                                 }
 
-                                Err(e) => Err(ClientError::HyperError(e)),
+                                Ok(Err(err)) => Err(ClientError::HyperError(err)),
+
+                                Err(_) => Err(ClientError::Timeout(
+                                    "Timed out attempting HTTP proxy handshake".into(),
+                                )),
                             }
                         }
 
@@ -514,7 +534,9 @@ impl Client {
                     },
 
                     Ok(Err(err)) => Err(ClientError::IoError(err)),
-                    Err(_) => Err(ClientError::Timeout),
+                    Err(_) => Err(ClientError::Timeout(
+                        "Timed out attempting proxy server connection: {e}".into(),
+                    )),
                 }
             }
         }
@@ -707,7 +729,7 @@ impl Client {
                     res
                 }
                 _ = tokio::time::sleep(timeout) => {
-                    Err(ClientError::Timeout)
+                    Err(ClientError::Timeout("Timed out during work_http1 fn".into()))
                 }
             }
         } else {
@@ -772,7 +794,7 @@ impl Client {
                     res
                 }
                 _ = tokio::time::sleep(timeout) => {
-                    Err(ClientError::Timeout)
+                    Err(ClientError::Timeout("Timed out during work_http2 fn".into()))
                 }
             }
         } else {
